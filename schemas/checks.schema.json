@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent Flight Recorder Checks",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["name", "status", "recorded_at"],
+    "properties": {
+      "name": { "type": "string" },
+      "status": { "type": "string", "enum": ["pass", "warn", "fail", "skip"] },
+      "command": { "type": "string" },
+      "summary": { "type": "string" },
+      "recorded_at": { "type": "string" }
+    }
+  }
+}
+

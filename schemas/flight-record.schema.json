@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent Flight Recorder Flight Record",
+  "type": "object",
+  "required": [
+    "run_id",
+    "mission",
+    "agent",
+    "started_at",
+    "risk_level",
+    "human_approval_required",
+    "human_approval_status"
+  ],
+  "properties": {
+    "run_id": { "type": "string" },
+    "mission": { "type": "string" },
+    "agent": { "type": "string" },
+    "started_at": { "type": "string" },
+    "finished_at": { "type": ["string", "null"] },
+    "risk_level": { "type": "string", "enum": ["GREEN", "AMBER", "RED", "BLACK"] },
+    "allowed_files": { "type": "array", "items": { "type": "string" } },
+    "blocked_files": { "type": "array", "items": { "type": "string" } },
+    "planned_files": { "type": "array", "items": { "type": "string" } },
+    "actual_files_touched": { "type": "array", "items": { "type": "string" } },
+    "unexpected_files_touched": { "type": "array", "items": { "type": "string" } },
+    "commands_run": { "type": "array" },
+    "checks": { "type": "array" },
+    "diff_summary": { "type": "string" },
+    "outcome": { "type": "string" },
+    "rollback": { "type": "string" },
+    "lessons": { "type": "array", "items": { "type": "string" } },
+    "human_approval_required": { "type": "boolean" },
+    "human_approval_status": {
+      "type": "string",
+      "enum": ["pending", "approved", "rejected", "not_required"]
+    }
+  }
+}
+
