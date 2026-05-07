@@ -56,6 +56,29 @@ afr report
 
 `afr report` prints the latest/current report to stdout and prints the report path.
 
+## What it looks like
+
+```
+$ afr start "Fix auth bug"
+Recording started. Run your coding agent now. When done, run: afr stop
+
+$ afr stop
+Report: .afr/sessions/20260507-174301-fix-auth-bug/report.md
+
+$ afr report
+Mission: Fix auth bug
+Duration: 42.8s
+Branch: main -> fix-auth-bug
+HEAD before: 4f7c2a9
+HEAD after:  8a3d51e
+Working tree: changed (3 files)
+Files changed: src/auth/session.py, tests/test_auth_session.py, docs/auth-notes.md
+Diff: .afr/sessions/20260507-174301-fix-auth-bug/git-diff.patch
+Raw evidence path: .afr/sessions/20260507-174301-fix-auth-bug
+```
+
+Full annotated example: [`docs/TERMINAL_DEMO.md`](docs/TERMINAL_DEMO.md)
+
 ## Commands
 
 ### `afr start "Mission text"`
