@@ -1,4 +1,11 @@
-"""Stdlib-only CLI for Agent Flight Recorder."""
+"""
+Simple Agent Flight Recorder CLI.
+
+Public golden path:
+    afr start "Fix auth bug"
+    afr stop
+    afr report
+"""
 
 from __future__ import annotations
 
@@ -7,569 +14,397 @@ import json
 import re
 import subprocess
 import sys
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 
-RUNS_DIR = ".agent-runs"
-MEMORY_DIR = ".agent-memory"
-CURRENT_RUN_FILE = "current-run.txt"
-
-RUN_FILES = {
-    "flight-record.json": None,
-    "mission.md": "# Mission\n\n",
-    "plan.md": "# Plan\n\n",
-    "commands.log": "",
-    "diff.patch": "",
-    "checks.json": "[]\n",
-    "lessons.md": "# Lessons\n\n",
-    "rollback.md": "# Rollback\n\n",
-    "final-report.md": "# Final Report\n\n",
-}
-
-FIREWALL_RULES = [
-    (
-        "private key block",
-        re.compile(
-            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
-            re.IGNORECASE | re.DOTALL,
-        ),
-        "[REDACTED_PRIVATE_KEY]",
-    ),
-    (
-        "connection string with credentials",
-        re.compile(r"\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^@\s]+@[^\s]+", re.IGNORECASE),
-        "[REDACTED_CONNECTION_STRING]",
-    ),
-    (
-        "secret-like assignment",
-        re.compile(
-            r"(?im)^\s*[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASS|API_KEY|BROKER_KEY)[A-Z0-9_]*\s*[:=]\s*.+$"
-        ),
-        "[REDACTED_SECRET_ASSIGNMENT]",
-    ),
-    (
-        "inline credential assignment",
-        re.compile(
-            r"(?i)\b(?:password|passwd|token|api_key|apikey|broker_key)\s*[:=]\s*[^\s,;]+"
-        ),
-        "[REDACTED_CREDENTIAL_ASSIGNMENT]",
-    ),
-    (
-        "common key prefix",
-        re.compile(
-            r"\b(?:sk-|pk_live_|rk_live_|AKIA|AIza|ghp_|ghs_|glpat-|xox[baprs]-|ya29\.)[A-Za-z0-9._-]{8,}"
-        ),
-        "[REDACTED_KEY_PREFIX]",
-    ),
-    (
-        "private data placeholder",
-        re.compile(r"(?i)<(?:customer|client|private|personal)[^>]*>|\[(?:customer|client|private|personal)[^\]]*\]"),
-        "[REDACTED_PRIVATE_DATA_PLACEHOLDER]",
-    ),
-]
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+def _run_git(args: list[str], cwd: Path) -> tuple[int, str, str]:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (FileNotFoundError, OSError) as exc:
+        return 1, "", str(exc)
+    return result.returncode, result.stdout, result.stderr
 
 
-def repo_root() -> Path:
-    return Path.cwd()
+def _require_repo(cwd: Path) -> Path:
+    code, stdout, stderr = _run_git(["rev-parse", "--show-toplevel"], cwd)
+    if code != 0 or not stdout.strip():
+        detail = stderr.strip() or "current directory is not inside a git repo"
+        raise RuntimeError(detail)
+    return Path(stdout.strip()).resolve()
 
 
-def runs_dir(root: Path) -> Path:
-    return root / RUNS_DIR
+def _git_text(args: list[str], repo: Path) -> str:
+    code, stdout, _stderr = _run_git(args, repo)
+    return stdout if code == 0 else ""
 
 
-def memory_dir(root: Path) -> Path:
-    return root / MEMORY_DIR
+def _git_value(args: list[str], repo: Path, default: str = "unknown") -> str:
+    value = _git_text(args, repo).strip()
+    return value or default
 
 
-def current_run_path(root: Path) -> Path:
-    return runs_dir(root) / CURRENT_RUN_FILE
+def _slugify(text: str) -> str:
+    slug = text.lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", slug).strip("-")
+    return slug[:48] or "mission"
 
 
-def run_dir(root: Path, run_id: str) -> Path:
-    return runs_dir(root) / run_id
+def _afr_root(repo: Path) -> Path:
+    return repo / ".afr"
 
 
-def ensure_workspace(root: Path) -> None:
-    runs = runs_dir(root)
-    memory = memory_dir(root)
-    runs.mkdir(exist_ok=True)
-    memory.mkdir(exist_ok=True)
-    run_ignore = runs / ".gitignore"
-    if not run_ignore.exists():
-        run_ignore.write_text("*\n!.gitignore\n", encoding="utf-8")
+def _sessions_root(repo: Path) -> Path:
+    return _afr_root(repo) / "sessions"
 
 
-def dedupe(items: list[str]) -> list[str]:
-    seen = set()
-    result = []
-    for item in items:
-        if item and item not in seen:
-            seen.add(item)
-            result.append(item)
-    return result
+def _current_path(repo: Path) -> Path:
+    return _afr_root(repo) / "current.json"
 
 
-def normalize_paths(paths: list[str] | None) -> list[str]:
-    return dedupe([(p or "").replace("\\", "/").strip() for p in (paths or []) if (p or "").strip()])
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
 
 
-def make_run_id(agent: str) -> str:
-    agent_slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", agent.strip().lower()).strip("-") or "agent"
-    return f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{agent_slug}-{uuid.uuid4().hex[:8]}"
+def _session_path(repo: Path, session_ref: str) -> Path:
+    session_dir = (repo / session_ref).resolve()
+    sessions_root = _sessions_root(repo).resolve()
+    if not _is_relative_to(session_dir, sessions_root):
+        raise RuntimeError("Invalid AFR session path in .afr/current.json")
+    return session_dir
 
 
-def default_record(args: argparse.Namespace, run_id: str) -> dict:
-    return {
-        "run_id": run_id,
-        "mission": args.mission,
-        "agent": args.agent,
-        "started_at": utc_now(),
-        "finished_at": None,
-        "risk_level": args.risk_level,
-        "allowed_files": normalize_paths(args.allowed_file),
-        "blocked_files": normalize_paths(args.blocked_file),
-        "planned_files": normalize_paths(args.planned_file),
-        "actual_files_touched": [],
-        "unexpected_files_touched": [],
-        "commands_run": [],
-        "checks": [],
-        "diff_summary": "",
-        "outcome": "",
-        "rollback": "",
-        "lessons": [],
-        "human_approval_required": args.human_approval_required == "yes",
-        "human_approval_status": "pending",
-    }
-
-
-def save_json(path: Path, data: object) -> None:
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-
-def load_record(root: Path, run_id: str) -> dict:
-    path = run_dir(root, run_id) / "flight-record.json"
-    if not path.exists():
-        raise SystemExit(f"Run not found: {run_id}")
+def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def save_record(root: Path, record: dict) -> None:
-    save_json(run_dir(root, record["run_id"]) / "flight-record.json", record)
+def _write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
-def active_run_id(root: Path) -> str:
-    path = current_run_path(root)
-    if not path.exists():
-        raise SystemExit("No active run. Pass --run-id or start a run first.")
-    run_id = path.read_text(encoding="utf-8").strip()
-    if not run_id:
-        raise SystemExit("Active run file is empty. Pass --run-id or start a new run.")
-    return run_id
+def _write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
 
 
-def resolve_run_id(root: Path, run_id: str | None) -> str:
-    return run_id or active_run_id(root)
-
-
-def write_required_run_files(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=False)
-    for name, content in RUN_FILES.items():
-        if content is not None:
-            (path / name).write_text(content, encoding="utf-8")
-
-
-def read_payload(args: argparse.Namespace) -> str:
-    if getattr(args, "rollback", None) is not None:
-        return args.rollback
-    if getattr(args, "rollback_file", None):
-        return Path(args.rollback_file).read_text(encoding="utf-8")
-    if getattr(args, "text", None) is not None:
-        return args.text
-    if getattr(args, "file", None):
-        return Path(args.file).read_text(encoding="utf-8")
-    if getattr(args, "stdin", False):
-        return sys.stdin.read()
-    return ""
-
-
-def append_section(path: Path, heading: str, body: str) -> None:
-    body = body.rstrip()
-    if not body:
-        return
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(f"\n## {heading}\n\n{body}\n")
-
-
-def parse_diff_files(diff_text: str) -> list[str]:
-    files: list[str] = []
-    for line in diff_text.splitlines():
-        if line.startswith("diff --git "):
-            parts = line.split()
-            if len(parts) >= 4:
-                candidate = parts[3]
-                if candidate.startswith("b/"):
-                    files.append(candidate[2:])
-        elif line.startswith("+++ b/"):
-            files.append(line[6:])
-    return normalize_paths([f for f in files if f != "/dev/null"])
-
-
-def update_touched_files(record: dict, touched: list[str]) -> None:
-    actual = normalize_paths(record.get("actual_files_touched", []) + touched)
-    expected = set(normalize_paths(record.get("allowed_files", []) + record.get("planned_files", [])))
-    blocked = set(normalize_paths(record.get("blocked_files", [])))
-    unexpected = []
-    for path in actual:
-        is_expected = path in expected or any(path.startswith(prefix.rstrip("/") + "/") for prefix in expected)
-        is_blocked = path in blocked or any(path.startswith(prefix.rstrip("/") + "/") for prefix in blocked)
-        if not is_expected or is_blocked:
-            unexpected.append(path)
-    record["actual_files_touched"] = actual
-    record["unexpected_files_touched"] = normalize_paths(unexpected)
-
-
-def run_git_diff() -> str:
+def _display_path(path: Path, repo: Path) -> str:
     try:
-        result = subprocess.run(
-            ["git", "diff", "--no-ext-diff"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except FileNotFoundError:
-        return ""
-    if result.returncode != 0:
-        return ""
-    return result.stdout
+        return path.resolve().relative_to(repo.resolve()).as_posix()
+    except ValueError:
+        return str(path)
 
 
-def apply_memory_firewall(text: str) -> tuple[str, list[str]]:
-    redacted = text
-    events: list[str] = []
-    for name, pattern, replacement in FIREWALL_RULES:
-        redacted, count = pattern.subn(replacement, redacted)
-        if count:
-            events.append(f"{name}: {count}")
-    return redacted, events
+def _is_afr_path(path: str) -> bool:
+    normalized = path.strip().strip('"').replace("\\", "/").rstrip("/")
+    if " -> " in normalized:
+        return any(_is_afr_path(part) for part in normalized.split(" -> ", 1))
+    return normalized == ".afr" or normalized.startswith(".afr/")
 
 
-def command_init(args: argparse.Namespace) -> int:
-    root = repo_root()
-    ensure_workspace(root)
-    print(f"Initialized {RUNS_DIR}/ and {MEMORY_DIR}/")
-    return 0
-
-
-def command_start(args: argparse.Namespace) -> int:
-    root = repo_root()
-    ensure_workspace(root)
-    run_id = args.run_id or make_run_id(args.agent)
-    path = run_dir(root, run_id)
-    write_required_run_files(path)
-    record = default_record(args, run_id)
-    save_record(root, record)
-    (path / "mission.md").write_text(f"# Mission\n\n{args.mission}\n", encoding="utf-8")
-    current_run_path(root).write_text(run_id + "\n", encoding="utf-8")
-    print(f"Started run: {run_id}")
-    print(f"Run directory: {path}")
-    return 0
-
-
-def command_add_plan(args: argparse.Namespace) -> int:
-    root = repo_root()
-    run_id = resolve_run_id(root, args.run_id)
-    record = load_record(root, run_id)
-    text = read_payload(args)
-    if text:
-        append_section(run_dir(root, run_id) / "plan.md", utc_now(), text)
-    record["planned_files"] = normalize_paths(record.get("planned_files", []) + normalize_paths(args.planned_file))
-    save_record(root, record)
-    print(f"Updated plan for run: {run_id}")
-    return 0
-
-
-def command_capture_diff(args: argparse.Namespace) -> int:
-    root = repo_root()
-    run_id = resolve_run_id(root, args.run_id)
-    record = load_record(root, run_id)
-    if args.from_file:
-        diff_text = Path(args.from_file).read_text(encoding="utf-8")
-    else:
-        diff_text = run_git_diff()
-    (run_dir(root, run_id) / "diff.patch").write_text(diff_text, encoding="utf-8")
-    update_touched_files(record, parse_diff_files(diff_text))
-    if args.summary:
-        record["diff_summary"] = args.summary
-    save_record(root, record)
-    print(f"Captured diff for run: {run_id}")
-    print(f"Files touched: {len(record['actual_files_touched'])}")
-    return 0
-
-
-def command_add_command(args: argparse.Namespace) -> int:
-    root = repo_root()
-    run_id = resolve_run_id(root, args.run_id)
-    record = load_record(root, run_id)
-    entry = {
-        "command": args.command,
-        "cwd": args.cwd or str(root),
-        "exit_code": args.exit_code,
-        "recorded_at": utc_now(),
-        "note": args.note or "",
-    }
-    record.setdefault("commands_run", []).append(entry)
-    with (run_dir(root, run_id) / "commands.log").open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(entry, sort_keys=True) + "\n")
-    save_record(root, record)
-    print(f"Recorded command for run: {run_id}")
-    return 0
-
-
-def command_add_check(args: argparse.Namespace) -> int:
-    root = repo_root()
-    run_id = resolve_run_id(root, args.run_id)
-    record = load_record(root, run_id)
-    entry = {
-        "name": args.name,
-        "status": args.status,
-        "command": args.command or "",
-        "summary": args.summary or "",
-        "recorded_at": utc_now(),
-    }
-    record.setdefault("checks", []).append(entry)
-    checks_path = run_dir(root, run_id) / "checks.json"
-    save_json(checks_path, record["checks"])
-    save_record(root, record)
-    print(f"Recorded check for run: {run_id}")
-    return 0
-
-
-def command_add_lesson(args: argparse.Namespace) -> int:
-    root = repo_root()
-    run_id = resolve_run_id(root, args.run_id)
-    record = load_record(root, run_id)
-    text = read_payload(args).strip()
-    if not text:
-        raise SystemExit("Lesson text is required.")
-    append_section(run_dir(root, run_id) / "lessons.md", utc_now(), text)
-    record.setdefault("lessons", []).append(text)
-    save_record(root, record)
-    print(f"Recorded lesson for run: {run_id}")
-    return 0
-
-
-def command_finish(args: argparse.Namespace) -> int:
-    root = repo_root()
-    run_id = resolve_run_id(root, args.run_id)
-    record = load_record(root, run_id)
-    rollback = read_payload(args).strip() or "Rollback requires human review before deployment."
-    record["finished_at"] = utc_now()
-    record["outcome"] = args.outcome
-    record["rollback"] = rollback
-    record["human_approval_status"] = args.human_approval_status
-    if args.diff_summary:
-        record["diff_summary"] = args.diff_summary
-    path = run_dir(root, run_id)
-    path.joinpath("rollback.md").write_text(f"# Rollback\n\n{rollback}\n", encoding="utf-8")
-    final = build_final_report(record)
-    path.joinpath("final-report.md").write_text(final, encoding="utf-8")
-    save_record(root, record)
-    current = current_run_path(root)
-    if current.exists() and current.read_text(encoding="utf-8").strip() == run_id:
-        current.unlink()
-    print(f"Finished run: {run_id}")
-    print(f"Outcome: {args.outcome}")
-    return 0
-
-
-def build_final_report(record: dict) -> str:
-    checks = record.get("checks", [])
-    lessons = record.get("lessons", [])
-    lines = [
-        "# Final Report",
-        "",
-        f"Run ID: {record['run_id']}",
-        f"Mission: {record.get('mission', '')}",
-        f"Agent: {record.get('agent', '')}",
-        f"Risk level: {record.get('risk_level', '')}",
-        f"Outcome: {record.get('outcome', '')}",
-        f"Human approval required: {record.get('human_approval_required', True)}",
-        f"Human approval status: {record.get('human_approval_status', '')}",
-        "",
-        "## Files",
-        "",
-        f"Planned: {', '.join(record.get('planned_files', [])) or 'none recorded'}",
-        f"Actual: {', '.join(record.get('actual_files_touched', [])) or 'none recorded'}",
-        f"Unexpected: {', '.join(record.get('unexpected_files_touched', [])) or 'none'}",
-        "",
-        "## Checks",
-        "",
-    ]
-    if checks:
-        for check in checks:
-            lines.append(f"- {check['name']}: {check['status']} - {check.get('summary', '')}")
-    else:
-        lines.append("- none recorded")
-    lines.extend(["", "## Diff Summary", "", record.get("diff_summary", "") or "No summary recorded."])
-    lines.extend(["", "## Rollback", "", record.get("rollback", "") or "No rollback recorded."])
-    lines.extend(["", "## Lessons", ""])
-    if lessons:
-        lines.extend([f"- {lesson}" for lesson in lessons])
-    else:
-        lines.append("- none recorded")
-    return "\n".join(lines).rstrip() + "\n"
-
-
-def command_build_memory(args: argparse.Namespace) -> int:
-    root = repo_root()
-    ensure_workspace(root)
-    sections = [
-        "# Project Memory",
-        "",
-        "Generated by Agent Flight Recorder from successful runs.",
-        "Review this file before committing it to a public repository.",
-        "",
-    ]
-    count = 0
-    for record_path in sorted(runs_dir(root).glob("*/flight-record.json")):
-        record = json.loads(record_path.read_text(encoding="utf-8"))
-        if record.get("outcome") != "success" and not args.include_non_success:
+def _parse_changed_files(status_text: str) -> list[str]:
+    files: list[str] = []
+    for line in status_text.splitlines():
+        if not line.strip() or len(line) < 4:
             continue
-        count += 1
-        sections.extend(memory_section(record))
-    if count == 0:
-        sections.extend(["## No Successful Runs Yet", "", "Finish a run with `--outcome success`, then rebuild memory.", ""])
-    memory_text = "\n".join(sections).rstrip() + "\n"
-    memory_text, events = apply_memory_firewall(memory_text)
-    if events:
-        memory_text += "\n## Memory Firewall Notes\n\n"
-        for event in events:
-            memory_text += f"- Redacted {event}\n"
-    memory_path = memory_dir(root) / "PROJECT_MEMORY.md"
-    memory_path.write_text(memory_text, encoding="utf-8")
-    print(f"Built memory: {memory_path}")
-    print(f"Runs included: {count}")
-    if events:
-        print(f"Memory firewall redactions: {len(events)}")
+        path = line[3:].strip().rstrip("/")
+        if _is_afr_path(path):
+            continue
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        if path and path not in files:
+            files.append(path)
+    return files
+
+
+def _filter_recorder_status(status_text: str) -> str:
+    lines = []
+    for line in status_text.splitlines():
+        path = line[3:].strip() if len(line) >= 4 else ""
+        if _is_afr_path(path):
+            continue
+        lines.append(line)
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _git_diff(repo: Path) -> str:
+    unstaged = _git_text(
+        ["diff", "--no-ext-diff", "--", ".", ":(exclude).afr/**"],
+        repo,
+    ).rstrip()
+    staged = _git_text(
+        ["diff", "--cached", "--no-ext-diff", "--", ".", ":(exclude).afr/**"],
+        repo,
+    ).rstrip()
+    parts = [
+        "## Unstaged changes",
+        unstaged or "(empty)",
+        "",
+        "## Staged changes",
+        staged or "(empty)",
+        "",
+    ]
+    return "\n".join(parts)
+
+
+def _latest_session(repo: Path) -> Path | None:
+    sessions_root = _sessions_root(repo)
+    if not sessions_root.is_dir():
+        return None
+    sessions = [path for path in sessions_root.iterdir() if path.is_dir()]
+    if not sessions:
+        return None
+    return sorted(sessions, key=lambda path: path.name)[-1]
+
+
+def _active_session(repo: Path) -> dict | None:
+    current = _current_path(repo)
+    if not current.exists():
+        return None
+    data = _read_json(current)
+    return data if data.get("active") else None
+
+
+def _session_from_current_or_latest(repo: Path) -> Path:
+    current = _current_path(repo)
+    if current.exists():
+        data = _read_json(current)
+        session_dir = data.get("session_dir")
+        if session_dir:
+            path = _session_path(repo, session_dir)
+            if path.is_dir():
+                return path
+
+    latest = _latest_session(repo)
+    if latest is not None:
+        return latest
+    raise RuntimeError("No AFR sessions found. Run: afr start \"Mission text\"")
+
+
+def _duration(started_at: str, ended_at: str) -> str:
+    try:
+        start = datetime.fromisoformat(started_at)
+        end = datetime.fromisoformat(ended_at)
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return "unknown"
+    seconds = max(0.0, (end - start).total_seconds())
+    return f"{seconds:.1f}s"
+
+
+def _fenced(text: str, language: str = "text") -> str:
+    body = text.rstrip() if text.strip() else "(empty)"
+    return f"```{language}\n{body}\n```"
+
+
+def _render_report(
+    repo: Path,
+    session_dir: Path,
+    before: dict,
+    after: dict,
+    status_before: str,
+    status_after: str,
+    diff_text: str,
+    changed_files: list[str],
+) -> str:
+    working_tree = (
+        f"changed ({len(changed_files)} file{'s' if len(changed_files) != 1 else ''})"
+        if changed_files
+        else "clean"
+    )
+    files_block = (
+        "\n".join(f"- `{path}`" for path in changed_files)
+        if changed_files
+        else "- No changed files recorded."
+    )
+
+    return "\n".join([
+        "# Agent Flight Recorder Report",
+        "",
+        "Raw evidence is the source of truth. Summaries are optional and should never replace the captured logs and diffs.",
+        "",
+        f"Mission: {before.get('mission', '')}",
+        f"Duration: {_duration(before.get('started_at', ''), after.get('ended_at', ''))}",
+        f"Repo: {repo}",
+        f"Branch: {before.get('branch', 'unknown')} -> {after.get('branch', 'unknown')}",
+        f"HEAD before: {before.get('head_sha', 'unknown')}",
+        f"HEAD after: {after.get('head_sha', 'unknown')}",
+        f"Working tree: {working_tree}",
+        "",
+        "Files changed:",
+        files_block,
+        "",
+        "Git status before:",
+        _fenced(status_before),
+        "",
+        "Git status after:",
+        _fenced(status_after),
+        "",
+        f"Diff: `{_display_path(session_dir / 'git-diff.patch', repo)}`",
+        _fenced(diff_text, "diff"),
+        "",
+        f"Raw evidence path: `{_display_path(session_dir, repo)}`",
+        "",
+    ])
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    repo = _require_repo(Path.cwd())
+    if _active_session(repo):
+        raise RuntimeError("An AFR recording is already active. Run: afr stop")
+
+    mission = " ".join(args.mission).strip()
+    started = _now()
+    session_id = f"{started.strftime('%Y%m%d-%H%M%S')}-{_slugify(mission)}"
+    session_dir = _sessions_root(repo) / session_id
+    session_dir.mkdir(parents=True, exist_ok=False)
+
+    status_before = _filter_recorder_status(_git_text(["status", "--short"], repo))
+    before = {
+        "schema_version": "0.1",
+        "session_id": session_id,
+        "mission": mission,
+        "started_at": started.isoformat(),
+        "repo_path": str(repo),
+        "branch": _git_value(["rev-parse", "--abbrev-ref", "HEAD"], repo),
+        "head_sha": _git_value(["rev-parse", "HEAD"], repo),
+    }
+
+    _write_json(session_dir / "before.json", before)
+    _write_text(session_dir / "git-status-before.txt", status_before)
+    _write_json(_current_path(repo), {
+        "active": True,
+        "session_id": session_id,
+        "session_dir": _display_path(session_dir, repo),
+        "started_at": before["started_at"],
+    })
+
+    print("Recording started. Run your coding agent now. When done, run: afr stop")
     return 0
 
 
-def memory_section(record: dict) -> list[str]:
-    lines = [
-        f"## {record.get('mission', 'Untitled mission')}",
-        "",
-        f"- Run ID: `{record.get('run_id', '')}`",
-        f"- Agent: {record.get('agent', '')}",
-        f"- Risk level: {record.get('risk_level', '')}",
-        f"- Outcome: {record.get('outcome', '')}",
-        f"- Files touched: {', '.join(record.get('actual_files_touched', [])) or 'none recorded'}",
-        f"- Unexpected files: {', '.join(record.get('unexpected_files_touched', [])) or 'none'}",
-        f"- Diff summary: {record.get('diff_summary', '') or 'none recorded'}",
-        "",
-        "### Checks",
-        "",
-    ]
-    checks = record.get("checks", [])
-    if checks:
-        lines.extend([f"- {check.get('name', '')}: {check.get('status', '')} - {check.get('summary', '')}" for check in checks])
-    else:
-        lines.append("- none recorded")
-    lines.extend(["", "### Lessons", ""])
-    lessons = record.get("lessons", [])
-    if lessons:
-        lines.extend([f"- {lesson}" for lesson in lessons])
-    else:
-        lines.append("- none recorded")
-    lines.extend(["", "### Rollback", "", record.get("rollback", "") or "No rollback recorded.", ""])
-    return lines
+def cmd_stop(_args: argparse.Namespace) -> int:
+    repo = _require_repo(Path.cwd())
+    active = _active_session(repo)
+    if not active:
+        raise RuntimeError("No active AFR recording. Run: afr start \"Mission text\"")
+
+    session_dir = _session_path(repo, active["session_dir"])
+    before = _read_json(session_dir / "before.json")
+    ended = _now()
+    status_after = _filter_recorder_status(_git_text(["status", "--short"], repo))
+    diff_text = _git_diff(repo)
+    changed_files = _parse_changed_files(status_after)
+    after = {
+        "schema_version": "0.1",
+        "session_id": before.get("session_id", session_dir.name),
+        "mission": before.get("mission", ""),
+        "started_at": before.get("started_at", ""),
+        "ended_at": ended.isoformat(),
+        "repo_path": str(repo),
+        "branch": _git_value(["rev-parse", "--abbrev-ref", "HEAD"], repo),
+        "head_sha": _git_value(["rev-parse", "HEAD"], repo),
+        "changed_files": changed_files,
+        "changed_files_count": len(changed_files),
+    }
+    status_before = (session_dir / "git-status-before.txt").read_text(
+        encoding="utf-8"
+    )
+
+    _write_json(session_dir / "after.json", after)
+    _write_text(session_dir / "git-status-after.txt", status_after)
+    _write_text(session_dir / "git-diff.patch", diff_text)
+    _write_text(session_dir / "files-changed.txt", "\n".join(changed_files) + ("\n" if changed_files else ""))
+    report = _render_report(
+        repo=repo,
+        session_dir=session_dir,
+        before=before,
+        after=after,
+        status_before=status_before,
+        status_after=status_after,
+        diff_text=diff_text,
+        changed_files=changed_files,
+    )
+    report_path = session_dir / "report.md"
+    _write_text(report_path, report)
+    _write_json(_current_path(repo), {
+        "active": False,
+        "session_id": after["session_id"],
+        "session_dir": _display_path(session_dir, repo),
+        "report_path": _display_path(report_path, repo),
+        "ended_at": after["ended_at"],
+    })
+
+    print(f"Report: {_display_path(report_path, repo)}")
+    return 0
 
 
-def add_text_args(parser: argparse.ArgumentParser) -> None:
-    source = parser.add_mutually_exclusive_group()
-    source.add_argument("--text", help="Text to add.")
-    source.add_argument("--file", help="Read text from a file.")
-    source.add_argument("--stdin", action="store_true", help="Read text from stdin.")
+def cmd_report(_args: argparse.Namespace) -> int:
+    repo = _require_repo(Path.cwd())
+    session_dir = _session_from_current_or_latest(repo)
+    report_path = session_dir / "report.md"
+    if not report_path.exists():
+        raise RuntimeError("No report found for the current session. Run: afr stop")
+
+    print(report_path.read_text(encoding="utf-8"), end="")
+    print(f"Report path: {_display_path(report_path, repo)}")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="agent-flight-recorder",
-        description="Black-box telemetry and project memory for AI coding agents.",
+        prog="afr",
+        description="Agent Flight Recorder: local-first black box recorder for AI coding agents.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    init_parser = sub.add_parser("init", help="Create .agent-runs/ and .agent-memory/.")
-    init_parser.set_defaults(func=command_init)
+    start = sub.add_parser("start", help="Start recording a mission.")
+    start.add_argument("mission", nargs="+", help='Mission text, e.g. "Fix auth bug".')
+    start.set_defaults(func=cmd_start)
 
-    start = sub.add_parser("start", help="Start a new flight record.")
-    start.add_argument("--mission", required=True)
-    start.add_argument("--agent", default="unspecified-agent")
-    start.add_argument("--risk-level", choices=["GREEN", "AMBER", "RED", "BLACK"], default="AMBER")
-    start.add_argument("--allowed-file", action="append")
-    start.add_argument("--blocked-file", action="append")
-    start.add_argument("--planned-file", action="append")
-    start.add_argument("--run-id")
-    start.add_argument("--human-approval-required", choices=["yes", "no"], default="yes")
-    start.set_defaults(func=command_start)
+    stop = sub.add_parser("stop", help="Stop the active recording and write report.md.")
+    stop.set_defaults(func=cmd_stop)
 
-    add_plan = sub.add_parser("add-plan", help="Add plan text and planned files.")
-    add_plan.add_argument("--run-id")
-    add_plan.add_argument("--planned-file", action="append")
-    add_text_args(add_plan)
-    add_plan.set_defaults(func=command_add_plan)
-
-    diff = sub.add_parser("capture-diff", help="Capture git diff or a patch file.")
-    diff.add_argument("--run-id")
-    diff.add_argument("--from-file")
-    diff.add_argument("--summary")
-    diff.set_defaults(func=command_capture_diff)
-
-    command = sub.add_parser("add-command", help="Record a command that was run elsewhere.")
-    command.add_argument("--run-id")
-    command.add_argument("--command", required=True)
-    command.add_argument("--exit-code", type=int, default=0)
-    command.add_argument("--cwd")
-    command.add_argument("--note")
-    command.set_defaults(func=command_add_command)
-
-    check = sub.add_parser("add-check", help="Record a safety check or test result.")
-    check.add_argument("--run-id")
-    check.add_argument("--name", required=True)
-    check.add_argument("--status", choices=["pass", "warn", "fail", "skip"], required=True)
-    check.add_argument("--command")
-    check.add_argument("--summary")
-    check.set_defaults(func=command_add_check)
-
-    lesson = sub.add_parser("add-lesson", help="Record a lesson for memory.")
-    lesson.add_argument("--run-id")
-    add_text_args(lesson)
-    lesson.set_defaults(func=command_add_lesson)
-
-    finish = sub.add_parser("finish", help="Finish a run and write final-report.md.")
-    finish.add_argument("--run-id")
-    finish.add_argument("--outcome", choices=["success", "partial", "failed", "cancelled"], required=True)
-    finish.add_argument("--diff-summary")
-    finish.add_argument("--human-approval-status", choices=["pending", "approved", "rejected", "not_required"], default="pending")
-    rollback_source = finish.add_mutually_exclusive_group()
-    rollback_source.add_argument("--rollback", help="Rollback plan text.")
-    rollback_source.add_argument("--rollback-file", help="Read rollback plan from a file.")
-    rollback_source.add_argument("--stdin", action="store_true", help="Read rollback plan from stdin.")
-    finish.set_defaults(func=command_finish)
-
-    memory = sub.add_parser("build-memory", help="Build .agent-memory/PROJECT_MEMORY.md from successful runs.")
-    memory.add_argument("--include-non-success", action="store_true", help="Include partial, failed, or cancelled runs.")
-    memory.set_defaults(func=command_build_memory)
+    report = sub.add_parser("report", help="Print the current/latest report.")
+    report.set_defaults(func=cmd_report)
 
     return parser
 
 
+def _configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main(argv: list[str] | None = None) -> int:
+    _configure_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

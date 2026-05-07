@@ -1,246 +1,147 @@
-# Agent Flight Recorder
+# Agent Flight Recorder (`afr`)
 
-> **Before agents get more autonomy, they need black boxes.**
+AI agents are flying blind. This is their flight recorder.
 
-Black-box telemetry and project memory for AI coding agents: capture missions,
-plans, diffs, commands, checks, outcomes, rollback paths, and lessons learned.
+Capture everything your coding agent changes before you lose it to scrollback.
 
-Agent Flight Recorder is a Python stdlib-only CLI. It writes structured run
-evidence into `.agent-runs/` and builds reusable project memory in
-`.agent-memory/`.
+```bash
+afr start "Fix auth bug"
+# run Claude Code, Codex, Aider, Cursor, OpenHands...
+afr stop
+afr report
+```
 
-## What This Is
+Agent Flight Recorder is a local-first black box recorder for AI coding agents. It captures git state before and after a mission, changed files, diffs, and a clean Markdown report.
 
-Agent Flight Recorder is a local evidence trail for AI coding work. It helps
-you answer:
+## Why
 
-- What mission did the agent receive?
-- What plan was approved?
-- Which files were planned, touched, or unexpected?
-- Which commands and checks were run?
-- What changed in the diff?
-- What was the outcome?
-- How do we roll it back?
-- What lesson should future agents remember?
+AI coding agents can move faster than your terminal scrollback. AFR gives each coding session a simple evidence trail:
 
-It is designed for human-controlled workflows. The recorder captures evidence;
-humans still approve plans, review diffs, and decide what merges.
+- What the mission was
+- Which repo, branch, and commit it started from
+- Which branch and commit it ended on
+- What the working tree looked like before and after
+- Which files changed
+- The raw git diff
+- A Markdown report you can paste into an issue, pull request, or handoff note
 
-## What This Is Not
+Raw evidence is the source of truth. Summaries are optional and should never replace the captured logs and diffs.
 
-- Not an autonomous agent.
-- Not a replacement for human review.
-- Not a secret store.
-- Not a sandbox.
-- Not a dependency-heavy observability stack.
-- Not a guarantee that an agent change is safe.
+## Install
 
-## Why Flight Records Matter
+```bash
+pip install -e .
+```
 
-AI coding agents often leave behind a diff and a chat transcript. That is not
-enough for real engineering work.
+During development, you can also run the CLI module directly:
 
-A useful agent run should leave a black-box record:
+```bash
+python -m agent_flight_recorder.cli --help
+```
+
+## Quickstart
+
+Run these commands from inside a git repository:
+
+```bash
+afr start "Fix auth bug"
+# run your coding agent or make manual changes
+afr stop
+afr report
+```
+
+`afr start` creates a local session and captures the initial git state.
+
+`afr stop` captures the final git state, changed files, diff, and writes `report.md`.
+
+`afr report` prints the latest/current report to stdout and prints the report path.
+
+## Commands
+
+### `afr start "Mission text"`
+
+Starts a recording session.
+
+It checks that the current directory is inside a git repo, creates a session under `.afr/sessions/`, captures branch and HEAD SHA, saves `git status --short`, and writes `.afr/current.json`.
+
+### `afr stop`
+
+Stops the active recording session.
+
+It captures final branch and HEAD SHA, saves `git status --short`, writes `git diff` to a patch file, records changed files, generates `report.md`, and marks the current session as closed.
+
+### `afr report`
+
+Prints the current or latest session report to stdout.
+
+Use this when you want to paste the mission report into a pull request, issue, chat, or release note.
+
+## Storage
+
+AFR writes local runtime evidence under `.afr/`:
 
 ```text
-Mission
-  |
-  v
-Plan
-  |
-  v
-Diff + Commands + Checks
-  |
-  v
-Outcome + Rollback
-  |
-  v
-Lessons Learned
-  |
-  v
-Project Memory
+.afr/
+  current.json
+  sessions/
+    <timestamp-slug>/
+      before.json
+      after.json
+      git-status-before.txt
+      git-status-after.txt
+      git-diff.patch
+      files-changed.txt
+      report.md
 ```
 
-That record makes PR review easier, rollback clearer, and future agent work
-less repetitive.
+`.afr/` is intended to stay local and should be gitignored. It can contain file paths, diffs, and other sensitive project context.
 
-## Quick Start
+## Report Format
 
-From a project repo:
+Reports are plain Markdown and start with:
 
-```bash
-python -m agent_flight_recorder init
+```markdown
+# Agent Flight Recorder Report
+
+Raw evidence is the source of truth. Summaries are optional and should never replace the captured logs and diffs.
+
+Mission:
+Duration:
+Repo:
+Branch:
+HEAD before:
+HEAD after:
+Working tree:
+Files changed:
+Git status before:
+Git status after:
+Diff:
+Raw evidence path:
 ```
 
-Start a run:
+## Example Report
 
-```bash
-python -m agent_flight_recorder start \
-  --mission "Add an API health badge to a dashboard." \
-  --agent "codex" \
-  --risk-level AMBER \
-  --allowed-file "src/dashboard/" \
-  --planned-file "src/dashboard/ApiHealthBadge.tsx"
-```
+See [`examples/sample-report.md`](examples/sample-report.md) for a concise public sample generated from a `Fix auth bug` mission.
 
-Add the approved plan:
+## Agent Compatibility
 
-```bash
-python -m agent_flight_recorder add-plan \
-  --text "Add one small badge, tests, and no unrelated cleanup." \
-  --planned-file "src/dashboard/ApiHealthBadge.test.tsx"
-```
+AFR records the repo around whatever tool you use. It works with local coding agents and manual workflows, including:
 
-Capture the current git diff:
+- Claude Code
+- Codex
+- Aider
+- Cursor
+- OpenHands
+- GitHub Copilot workflows
+- Any editor or terminal workflow that changes files in a git repo
 
-```bash
-python -m agent_flight_recorder capture-diff \
-  --summary "Adds a small dashboard health badge and focused tests."
-```
+## Safety Notes
 
-Record commands and checks:
-
-```bash
-python -m agent_flight_recorder add-command \
-  --command "python -m unittest" \
-  --exit-code 0 \
-  --note "Recorded after local verification."
-```
-
-```bash
-python -m agent_flight_recorder add-check \
-  --name "unit tests" \
-  --status pass \
-  --command "python -m unittest" \
-  --summary "Relevant tests passed."
-```
-
-Finish the run:
-
-```bash
-python -m agent_flight_recorder finish \
-  --outcome success \
-  --human-approval-status approved \
-  --diff-summary "Dashboard badge added with tests." \
-  --rollback "Revert the PR if the dashboard badge causes confusion."
-```
-
-Build project memory:
-
-```bash
-python -m agent_flight_recorder build-memory
-```
-
-## CLI Commands
-
-- `init` creates `.agent-runs/` and `.agent-memory/`.
-- `start` creates a run directory and required run files.
-- `add-plan` records the plan and planned files.
-- `capture-diff` writes `diff.patch` from `git diff` or a patch file.
-- `add-command` records a command that was run. It does not execute it.
-- `add-check` records a safety check or test result.
-- `add-lesson` records a lesson for future runs.
-- `finish` writes rollback notes, outcome, and `final-report.md`.
-- `build-memory` generates `.agent-memory/PROJECT_MEMORY.md`.
-
-Convenience wrappers are available:
-
-```bash
-bash scripts/afr.sh --help
-```
-
-```powershell
-.\scripts\afr.ps1 --help
-```
-
-## Run Files
-
-Each run creates:
-
-- `flight-record.json`
-- `mission.md`
-- `plan.md`
-- `commands.log`
-- `diff.patch`
-- `checks.json`
-- `lessons.md`
-- `rollback.md`
-- `final-report.md`
-
-Run records are local evidence. Review them before sharing or committing.
-
-## Memory Layer
-
-`build-memory` reads successful runs and writes:
-
-```text
-.agent-memory/PROJECT_MEMORY.md
-```
-
-The memory file is intentionally short. It keeps reusable information:
-
-- mission outcome
-- files touched
-- check results
-- rollback notes
-- lessons learned
-
-Failed and cancelled runs are excluded by default. Use
-`--include-non-success` only when a human wants those lessons included.
-
-## Memory Firewall
-
-Before writing memory, Agent Flight Recorder scans the generated memory text
-for likely sensitive material and redacts it.
-
-The firewall looks for:
-
-- API key and token-like prefixes
-- password or secret-like assignments
-- private key blocks
-- connection strings with embedded credentials
-- `.env`-style sensitive lines
-- broker key fields
-- private or customer data placeholders
-
-This is a guardrail, not a promise. Do not feed secrets into agent runs, and
-review `.agent-memory/PROJECT_MEMORY.md` before committing it.
-
-## Special Agent Ops Integration
-
-Agent Flight Recorder pairs with
-[Special Agent Ops](https://github.com/gorillapioneer/special-agent-ops).
-
-Use Special Agent Ops to define the workflow:
-
-- mission brief
-- boundaries
-- risk level
-- PR checklist
-- safety gate
-- rollback expectations
-
-Use Agent Flight Recorder to capture the evidence:
-
-- the approved mission and plan
-- what the agent actually touched
-- commands and checks
-- final outcome
-- lessons for future runs
-
-Together, they keep agent work reviewable and reusable without pretending that
-agents replace developers.
-
-## Roadmap
-
-- Validate flight records against the JSON schema.
-- Add richer diff summaries without storing sensitive content in memory.
-- Add optional export bundles for PR review.
-- Add merge-request templates for flight-record links.
-- Add stricter memory firewall modes.
-- Add examples for multi-agent handoff.
+- AFR records local git evidence; it does not judge whether an agent's changes are correct.
+- Review diffs before sharing reports or committing code.
+- Do not commit `.afr/` unless you have intentionally scrubbed the contents.
+- Treat captured diffs and paths as potentially sensitive.
 
 ## License
 
-MIT
-
+MIT. See [`LICENSE`](LICENSE).
