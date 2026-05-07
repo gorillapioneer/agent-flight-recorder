@@ -123,6 +123,11 @@ Raw evidence path:
 
 See [`examples/sample-report.md`](examples/sample-report.md) for a concise public sample generated from a `Fix auth bug` mission.
 
+## Demo and Launch Notes
+
+- [`docs/DEMO_SCRIPT.md`](docs/DEMO_SCRIPT.md) - simple 30-60 second demo flow.
+- [`docs/LAUNCH_CHECKLIST.md`](docs/LAUNCH_CHECKLIST.md) - checklist before sharing the repo publicly.
+
 ## Agent Compatibility
 
 AFR records the repo around whatever tool you use. It works with local coding agents and manual workflows, including:
