@@ -1,4 +1,4 @@
-"""CLI smoke test for Agent Flight Recorder."""
+"""CLI smoke test for the Agent Flight Recorder v0.1 golden path."""
 
 from __future__ import annotations
 
@@ -11,15 +11,12 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-RUN_ID = "smoke-run-001"
 
 
-def run_cli(project: Path, *args: str) -> str:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+def run(cmd: list[str], cwd: Path, *, env: dict[str, str] | None = None) -> str:
     result = subprocess.run(
-        [sys.executable, "-m", "agent_flight_recorder", *args],
-        cwd=project,
+        cmd,
+        cwd=cwd,
         env=env,
         text=True,
         capture_output=True,
@@ -31,125 +28,71 @@ def run_cli(project: Path, *args: str) -> str:
     return output
 
 
+def run_cli(project: Path, *args: str) -> str:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    return run([sys.executable, "-m", "agent_flight_recorder", *args], project, env=env)
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="afr-smoke-") as tmp:
         project = Path(tmp)
-        patch = project / "demo.patch"
-        patch.write_text(
-            "\n".join(
-                [
-                    "diff --git a/dashboard.txt b/dashboard.txt",
-                    "--- a/dashboard.txt",
-                    "+++ b/dashboard.txt",
-                    "@@ -1 +1,2 @@",
-                    " Dashboard",
-                    "+API health badge: SAFE_PLACEHOLDER_STATUS",
-                    "",
-                ]
-            ),
-            encoding="utf-8",
-        )
 
-        run_cli(project, "init")
-        run_cli(
-            project,
-            "start",
-            "--run-id",
-            RUN_ID,
-            "--mission",
-            "Add an API health badge to a dashboard.",
-            "--agent",
-            "smoke-agent",
-            "--risk-level",
-            "AMBER",
-            "--allowed-file",
-            "dashboard.txt",
-            "--planned-file",
-            "dashboard.txt",
-        )
-        run_cli(
-            project,
-            "add-plan",
-            "--text",
-            "Add one badge, keep the change scoped, and leave review to a human.",
-            "--planned-file",
-            "dashboard.txt",
-        )
-        run_cli(
-            project,
-            "capture-diff",
-            "--from-file",
-            str(patch),
-            "--summary",
-            "Adds a safe placeholder status badge line to the dashboard.",
-        )
-        run_cli(
-            project,
-            "add-command",
-            "--command",
-            "python -m unittest",
-            "--exit-code",
-            "0",
-            "--note",
-            "Recorded smoke-test command, not executed by the recorder.",
-        )
-        run_cli(
-            project,
-            "add-check",
-            "--name",
-            "smoke-check",
-            "--status",
-            "pass",
-            "--command",
-            "python -m unittest",
-            "--summary",
-            "Smoke check passed.",
-        )
-        run_cli(
-            project,
-            "add-lesson",
-            "--text",
-            "Keep dashboard status changes small and avoid <customer-placeholder> in reusable memory.",
-        )
-        run_cli(
-            project,
-            "finish",
-            "--outcome",
-            "success",
-            "--human-approval-status",
-            "approved",
-            "--diff-summary",
-            "Small dashboard badge change.",
-            "--rollback",
-            "Revert the dashboard badge change if the UI status is confusing.",
-        )
-        run_cli(project, "build-memory")
+        run(["git", "init"], project)
+        run(["git", "config", "user.email", "afr-smoke@example.com"], project)
+        run(["git", "config", "user.name", "AFR Smoke"], project)
 
-        run_dir = project / ".agent-runs" / RUN_ID
+        readme = project / "README.md"
+        readme.write_text("hello\n", encoding="utf-8")
+        run(["git", "add", "README.md"], project)
+        run(["git", "commit", "-m", "initial"], project)
+
+        start_output = run_cli(project, "start", "Smoke test simple recorder")
+        assert "Recording started" in start_output
+
+        readme.write_text("changed\n", encoding="utf-8")
+        run(["git", "add", "README.md"], project)
+        (project / "notes.txt").write_text("extra\n", encoding="utf-8")
+
+        stop_output = run_cli(project, "stop")
+        assert "Report: .afr/sessions/" in stop_output
+
+        report_output = run_cli(project, "report")
+        assert "# Agent Flight Recorder Report" in report_output
+        assert "Mission: Smoke test simple recorder" in report_output
+        assert "README.md" in report_output
+        assert "notes.txt" in report_output
+
+        afr_root = project / ".afr"
+        current = json.loads((afr_root / "current.json").read_text(encoding="utf-8"))
+        assert current["active"] is False
+
+        sessions = list((afr_root / "sessions").iterdir())
+        assert len(sessions) == 1
+        session = sessions[0]
         required = [
-            "flight-record.json",
-            "mission.md",
-            "plan.md",
-            "commands.log",
-            "diff.patch",
-            "checks.json",
-            "lessons.md",
-            "rollback.md",
-            "final-report.md",
+            "before.json",
+            "after.json",
+            "git-status-before.txt",
+            "git-status-after.txt",
+            "git-diff.patch",
+            "files-changed.txt",
+            "report.md",
         ]
-        missing = [name for name in required if not (run_dir / name).exists()]
+        missing = [name for name in required if not (session / name).exists()]
         if missing:
-            raise AssertionError(f"Missing run files: {missing}")
+            raise AssertionError(f"Missing AFR session files: {missing}")
 
-        record = json.loads((run_dir / "flight-record.json").read_text(encoding="utf-8"))
-        assert record["outcome"] == "success"
-        assert record["actual_files_touched"] == ["dashboard.txt"]
-        assert record["unexpected_files_touched"] == []
-        memory = (project / ".agent-memory" / "PROJECT_MEMORY.md").read_text(encoding="utf-8")
-        assert "Add an API health badge" in memory
-        assert "SAFE_PLACEHOLDER_STATUS" not in memory
-        assert "<customer-placeholder>" not in memory
-        assert "[REDACTED_PRIVATE_DATA_PLACEHOLDER]" in memory
+        changed_files = (session / "files-changed.txt").read_text(encoding="utf-8")
+        assert "README.md" in changed_files
+        assert "notes.txt" in changed_files
+        assert ".afr" not in changed_files
+
+        patch = (session / "git-diff.patch").read_text(encoding="utf-8")
+        assert "## Unstaged changes" in patch
+        assert "## Staged changes" in patch
+        assert "README.md" in patch
+        assert ".afr" not in patch
 
     print("SMOKE TEST PASSED")
     return 0
