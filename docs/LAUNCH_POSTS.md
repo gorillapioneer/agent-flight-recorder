@@ -133,7 +133,7 @@ It captures:
 - a report.md you can paste into a PR or issue
 
 No cloud. No daemon. No config. It writes everything under .afr/ in your repo.
-Pure Python, stdlib-only except for GitPython.
+Pure Python. Uses Git through the local git CLI.
 
 The idea is simple: agents move fast and terminal output is lossy.
 This gives each session a permanent, readable evidence trail.
