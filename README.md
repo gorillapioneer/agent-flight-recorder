@@ -151,6 +151,11 @@ See [`examples/sample-report.md`](examples/sample-report.md) for a concise publi
 - [`docs/DEMO_SCRIPT.md`](docs/DEMO_SCRIPT.md) - simple 30-60 second demo flow.
 - [`docs/LAUNCH_CHECKLIST.md`](docs/LAUNCH_CHECKLIST.md) - checklist before sharing the repo publicly.
 
+## Launch Materials
+
+- [`docs/LAUNCH_POSTS.md`](docs/LAUNCH_POSTS.md) - post drafts, taglines, and video captions.
+- [`docs/RECORDING_PLAN.md`](docs/RECORDING_PLAN.md) - 30-second recording plan with commands, overlays, and voiceover.
+
 ## Agent Compatibility
 
 AFR records the repo around whatever tool you use. It works with local coding agents and manual workflows, including:
