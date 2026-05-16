@@ -9,6 +9,7 @@ afr start "Fix auth bug"
 # run Claude Code, Codex, Aider, Cursor, OpenHands...
 afr stop
 afr report
+afr handoff
 ```
 
 Agent Flight Recorder is a local-first black box recorder for AI coding agents. It captures git state before and after a mission, changed files, diffs, and a clean Markdown report.
@@ -24,6 +25,8 @@ AI coding agents can move faster than your terminal scrollback. AFR gives each c
 - Which files changed
 - The raw git diff
 - A Markdown report you can paste into an issue, pull request, or handoff note
+- A memory capsule for compact, evidence-linked recall
+- A handoff prompt for continuing work in another agent
 
 Raw evidence is the source of truth. Summaries are optional and should never replace the captured logs and diffs.
 
@@ -48,13 +51,16 @@ afr start "Fix auth bug"
 # run your coding agent or make manual changes
 afr stop
 afr report
+afr handoff
 ```
 
 `afr start` creates a local session and captures the initial git state.
 
-`afr stop` captures the final git state, changed files, diff, and writes `report.md`.
+`afr stop` captures the final git state, changed files, diff, writes `report.md`, and also writes `memory-capsule.md/json`.
 
 `afr report` prints the latest/current report to stdout and prints the report path.
+
+`afr handoff` prints a copy-paste prompt for handing the latest/current session to ChatGPT, Codex, Claude Code, Devin, or another coding agent.
 
 ## What it looks like
 
@@ -75,6 +81,17 @@ Working tree: changed (3 files)
 Files changed: src/auth/session.py, tests/test_auth_session.py, docs/auth-notes.md
 Diff: .afr/sessions/20260507-174301-fix-auth-bug/git-diff.patch
 Raw evidence path: .afr/sessions/20260507-174301-fix-auth-bug
+
+$ afr handoff
+# AFR Agent Handoff
+Mission: Fix auth bug
+Files changed:
+- `src/auth/session.py`
+- `tests/test_auth_session.py`
+Raw evidence:
+- Report: `.afr/sessions/20260507-174301-fix-auth-bug/report.md`
+- Memory capsule: `.afr/sessions/20260507-174301-fix-auth-bug/memory-capsule.md`
+- Diff: `.afr/sessions/20260507-174301-fix-auth-bug/git-diff.patch`
 ```
 
 Full annotated example: [`docs/TERMINAL_DEMO.md`](docs/TERMINAL_DEMO.md)
@@ -91,13 +108,19 @@ It checks that the current directory is inside a git repo, creates a session und
 
 Stops the active recording session.
 
-It captures final branch and HEAD SHA, saves `git status --short`, writes `git diff` to a patch file, records changed files, generates `report.md`, and marks the current session as closed.
+It captures final branch and HEAD SHA, saves `git status --short`, writes `git diff` to a patch file, records changed files, generates `report.md`, writes `memory-capsule.md/json`, and marks the current session as closed.
 
 ### `afr report`
 
 Prints the current or latest session report to stdout.
 
 Use this when you want to paste the mission report into a pull request, issue, chat, or release note.
+
+### `afr handoff`
+
+Prints a copy-paste continuation prompt for the current or latest session.
+
+Use this when moving work between agents or chats. The prompt points at the report, memory capsule, diff, changed-file list, and session directory.
 
 ## Storage
 
@@ -115,6 +138,8 @@ AFR writes local runtime evidence under `.afr/`:
       git-diff.patch
       files-changed.txt
       report.md
+      memory-capsule.md
+      memory-capsule.json
 ```
 
 `.afr/` is intended to stay local and should be gitignored. It can contain file paths, diffs, and other sensitive project context.
@@ -142,6 +167,19 @@ Diff:
 Raw evidence path:
 ```
 
+## Memory Capsule and Handoff
+
+Each completed session also writes a compact memory capsule:
+
+```text
+memory-capsule.md
+memory-capsule.json
+```
+
+The capsule records mission, outcome, duration, branch/HEAD movement, changed files, evidence paths, and empty note slots for decisions, bugs, working commands, failed commands, and lessons.
+
+`afr handoff` turns the latest/current session into a continuation prompt for another agent. It does not invent a summary. It points the next agent back to the evidence.
+
 ## Example Report
 
 See [`examples/sample-report.md`](examples/sample-report.md) for a concise public sample generated from a `Fix auth bug` mission.
@@ -150,6 +188,7 @@ See [`examples/sample-report.md`](examples/sample-report.md) for a concise publi
 
 - [`docs/DEMO_SCRIPT.md`](docs/DEMO_SCRIPT.md) - simple 30-60 second demo flow.
 - [`docs/LAUNCH_CHECKLIST.md`](docs/LAUNCH_CHECKLIST.md) - checklist before sharing the repo publicly.
+- [`docs/AGENT_HANDOFF.md`](docs/AGENT_HANDOFF.md) - memory capsule and handoff workflow.
 
 ## Launch Materials
 
