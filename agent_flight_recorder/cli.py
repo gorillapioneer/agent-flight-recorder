@@ -5,6 +5,7 @@ Public golden path:
     afr start "Fix auth bug"
     afr stop
     afr report
+    afr handoff
 """
 
 from __future__ import annotations
@@ -215,6 +216,196 @@ def _fenced(text: str, language: str = "text") -> str:
     return f"```{language}\n{body}\n```"
 
 
+def _read_text_if_exists(path: Path) -> str:
+    return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+def _working_tree_label(changed_files: list[str]) -> str:
+    return (
+        f"changed ({len(changed_files)} file{'s' if len(changed_files) != 1 else ''})"
+        if changed_files
+        else "clean"
+    )
+
+
+def _files_block(changed_files: list[str]) -> str:
+    return (
+        "\n".join(f"- `{path}`" for path in changed_files)
+        if changed_files
+        else "- No changed files recorded."
+    )
+
+
+def _evidence_paths(repo: Path, session_dir: Path) -> dict[str, str]:
+    return {
+        "session_dir": _display_path(session_dir, repo),
+        "report": _display_path(session_dir / "report.md", repo),
+        "memory_capsule_md": _display_path(session_dir / "memory-capsule.md", repo),
+        "memory_capsule_json": _display_path(session_dir / "memory-capsule.json", repo),
+        "diff": _display_path(session_dir / "git-diff.patch", repo),
+        "files_changed": _display_path(session_dir / "files-changed.txt", repo),
+        "status_before": _display_path(session_dir / "git-status-before.txt", repo),
+        "status_after": _display_path(session_dir / "git-status-after.txt", repo),
+    }
+
+
+def _render_memory_capsule_json(
+    repo: Path,
+    session_dir: Path,
+    before: dict,
+    after: dict,
+    changed_files: list[str],
+) -> dict:
+    return {
+        "schema_version": "0.2",
+        "kind": "afr.memory_capsule",
+        "session_id": after.get("session_id") or before.get("session_id") or session_dir.name,
+        "mission": before.get("mission", ""),
+        "outcome": _working_tree_label(changed_files),
+        "duration": _duration(before.get("started_at", ""), after.get("ended_at", "")),
+        "repo_path": str(repo),
+        "started_at": before.get("started_at", ""),
+        "ended_at": after.get("ended_at", ""),
+        "branch_before": before.get("branch", "unknown"),
+        "branch_after": after.get("branch", "unknown"),
+        "head_before": before.get("head_sha", "unknown"),
+        "head_after": after.get("head_sha", "unknown"),
+        "changed_files": changed_files,
+        "evidence_paths": _evidence_paths(repo, session_dir),
+        "notes": {
+            "important_decisions": [],
+            "bugs_discovered": [],
+            "commands_that_worked": [],
+            "commands_that_failed": [],
+            "useful_lesson_for_next_agent": "",
+            "rollback_note": "Review git-diff.patch and revert the listed files if needed.",
+        },
+    }
+
+
+def _render_memory_capsule_md(capsule: dict) -> str:
+    files = capsule.get("changed_files", [])
+    evidence = capsule.get("evidence_paths", {})
+    files_block = _files_block(files)
+    evidence_block = "\n".join(
+        f"- {label}: `{path}`" for label, path in evidence.items()
+    )
+    return "\n".join([
+        "# AFR Memory Capsule",
+        "",
+        "This is a compact, evidence-linked memory note for the next agent. Raw evidence remains the source of truth.",
+        "",
+        f"Mission: {capsule.get('mission', '')}",
+        f"Outcome: {capsule.get('outcome', '')}",
+        f"Duration: {capsule.get('duration', '')}",
+        f"Repo: {capsule.get('repo_path', '')}",
+        f"Branch: {capsule.get('branch_before', 'unknown')} -> {capsule.get('branch_after', 'unknown')}",
+        f"HEAD: {capsule.get('head_before', 'unknown')} -> {capsule.get('head_after', 'unknown')}",
+        "",
+        "Files changed:",
+        files_block,
+        "",
+        "Important decisions:",
+        "- Not recorded automatically. Add human or agent notes here after review.",
+        "",
+        "Bugs discovered:",
+        "- Not recorded automatically. Add confirmed bugs here after review.",
+        "",
+        "Commands that worked:",
+        "- Not recorded automatically. Add known-good commands here after review.",
+        "",
+        "Commands that failed:",
+        "- Not recorded automatically. Add failed commands here after review.",
+        "",
+        "Useful lesson for next agent:",
+        "- Inspect the report and diff before continuing. Do not treat this capsule as a substitute for evidence.",
+        "",
+        "Rollback note:",
+        "- Review `git-diff.patch` and revert the listed files if needed.",
+        "",
+        "Raw evidence:",
+        evidence_block or "- No evidence paths recorded.",
+        "",
+    ])
+
+
+def _write_memory_capsule(
+    repo: Path,
+    session_dir: Path,
+    before: dict,
+    after: dict,
+    changed_files: list[str],
+) -> dict:
+    capsule = _render_memory_capsule_json(repo, session_dir, before, after, changed_files)
+    _write_json(session_dir / "memory-capsule.json", capsule)
+    _write_text(session_dir / "memory-capsule.md", _render_memory_capsule_md(capsule))
+    return capsule
+
+
+def _load_session_artifacts(repo: Path, session_dir: Path) -> tuple[dict, dict, list[str]]:
+    before_path = session_dir / "before.json"
+    after_path = session_dir / "after.json"
+    if not before_path.exists() or not after_path.exists():
+        raise RuntimeError("Session is incomplete. Run: afr stop")
+
+    before = _read_json(before_path)
+    after = _read_json(after_path)
+    changed_files = after.get("changed_files")
+    if not isinstance(changed_files, list):
+        changed_files = _parse_changed_files(_read_text_if_exists(session_dir / "git-status-after.txt"))
+    return before, after, [str(path) for path in changed_files]
+
+
+def _render_handoff_prompt(
+    repo: Path,
+    session_dir: Path,
+    before: dict,
+    after: dict,
+    changed_files: list[str],
+) -> str:
+    evidence = _evidence_paths(repo, session_dir)
+    files_block = _files_block(changed_files)
+    return "\n".join([
+        "# AFR Agent Handoff",
+        "",
+        "You are continuing a coding mission recorded by Agent Flight Recorder.",
+        "Treat the raw evidence as the source of truth. Do not assume the previous agent was correct.",
+        "",
+        f"Mission: {before.get('mission', '')}",
+        f"Repo: {repo}",
+        f"Session: {after.get('session_id') or before.get('session_id') or session_dir.name}",
+        f"Duration: {_duration(before.get('started_at', ''), after.get('ended_at', ''))}",
+        f"Branch: {before.get('branch', 'unknown')} -> {after.get('branch', 'unknown')}",
+        f"HEAD: {before.get('head_sha', 'unknown')} -> {after.get('head_sha', 'unknown')}",
+        f"Working tree: {_working_tree_label(changed_files)}",
+        "",
+        "Files changed:",
+        files_block,
+        "",
+        "Tests run:",
+        "- Not recorded automatically by AFR. Check the report, terminal logs, CI, or project notes.",
+        "",
+        "Known risks:",
+        "- Review `git-diff.patch` before trusting the changes.",
+        "- Re-run the relevant tests before continuing or merging.",
+        "- Keep `.afr/` local and uncommitted unless intentionally scrubbed.",
+        "",
+        "Next recommended step:",
+        "1. Read `report.md`.",
+        "2. Inspect `git-diff.patch`.",
+        "3. Continue from the changed files above.",
+        "4. Add human notes to `memory-capsule.md` if anything important should be remembered.",
+        "",
+        "Raw evidence:",
+        f"- Report: `{evidence['report']}`",
+        f"- Memory capsule: `{evidence['memory_capsule_md']}`",
+        f"- Diff: `{evidence['diff']}`",
+        f"- Files changed: `{evidence['files_changed']}`",
+        f"- Session directory: `{evidence['session_dir']}`",
+        "",
+    ])
+
+
 def _render_report(
     repo: Path,
     session_dir: Path,
@@ -225,16 +416,8 @@ def _render_report(
     diff_text: str,
     changed_files: list[str],
 ) -> str:
-    working_tree = (
-        f"changed ({len(changed_files)} file{'s' if len(changed_files) != 1 else ''})"
-        if changed_files
-        else "clean"
-    )
-    files_block = (
-        "\n".join(f"- `{path}`" for path in changed_files)
-        if changed_files
-        else "- No changed files recorded."
-    )
+    working_tree = _working_tree_label(changed_files)
+    files_block = _files_block(changed_files)
 
     return "\n".join([
         "# Agent Flight Recorder Report",
@@ -345,11 +528,19 @@ def cmd_stop(_args: argparse.Namespace) -> int:
     )
     report_path = session_dir / "report.md"
     _write_text(report_path, report)
+    capsule = _write_memory_capsule(
+        repo=repo,
+        session_dir=session_dir,
+        before=before,
+        after=after,
+        changed_files=changed_files,
+    )
     _write_json(_current_path(repo), {
         "active": False,
         "session_id": after["session_id"],
         "session_dir": _display_path(session_dir, repo),
         "report_path": _display_path(report_path, repo),
+        "memory_capsule_path": capsule["evidence_paths"]["memory_capsule_md"],
         "ended_at": after["ended_at"],
     })
 
@@ -369,6 +560,19 @@ def cmd_report(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_handoff(_args: argparse.Namespace) -> int:
+    repo = _require_repo(Path.cwd())
+    session_dir = _session_from_current_or_latest(repo)
+    before, after, changed_files = _load_session_artifacts(repo, session_dir)
+
+    capsule_path = session_dir / "memory-capsule.md"
+    if not capsule_path.exists():
+        _write_memory_capsule(repo, session_dir, before, after, changed_files)
+
+    print(_render_handoff_prompt(repo, session_dir, before, after, changed_files), end="")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="afr",
@@ -385,6 +589,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     report = sub.add_parser("report", help="Print the current/latest report.")
     report.set_defaults(func=cmd_report)
+
+    handoff = sub.add_parser("handoff", help="Print a copy-paste handoff prompt for the current/latest session.")
+    handoff.set_defaults(func=cmd_handoff)
 
     return parser
 
